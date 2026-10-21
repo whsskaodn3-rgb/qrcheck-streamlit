@@ -48,7 +48,7 @@ begin
  if p_raw is null or p_raw !~ '^SCAN:[A-Za-z0-9_-]{8,128}$' then
   raise exception 'QRCheck QR 형식이 아닙니다.';
  end if;
- if p_source not in ('metamask-rpc', 'browser-camera', 'manual-test') then
+ if p_source not in ('metamask-rpc', 'browser-camera', 'manual-test', 'qr-url') then
   raise exception '허용되지 않은 스캔 출처입니다.';
  end if;
  v_qr_id := substring(p_raw from 6);
