@@ -15,7 +15,7 @@ from threading import RLock
 
 PIN_RE = re.compile(r"^[0-9]{1,32}$")
 RAW_RE = re.compile(r"^SCAN:([A-Za-z0-9_-]{8,128})$")
-SOURCE_ALLOWLIST = {"metamask-rpc", "browser-camera", "manual-test"}
+SOURCE_ALLOWLIST = {"metamask-rpc", "browser-camera", "manual-test", "qr-url"}
 MAX_ATTEMPTS = 5
 
 
