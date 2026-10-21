@@ -13,7 +13,8 @@ import qrcode
 import streamlit as st
 import streamlit.components.v1 as components
 
-from storage import AppError, SQLiteBackend, SupabaseBackend
+from storage import AppError, SQLiteBackend, SupabaseBackend, qr_id_from_raw
+from qr_links import fixed_qr_url, normalize_app_base
 
 st.set_page_config(page_title="QRCheck", page_icon="▣", layout="centered")
 COMPONENT_DIR = Path(__file__).parent / "components" / "scanner"
@@ -74,6 +75,79 @@ def current_backend():
     return get_backend(url, key, setting("LOCAL_DB", "data/qrcheck.sqlite3")), bool(url)
 
 
+def app_base_url() -> str:
+    """Use the explicitly configured public URL; fall back to Streamlit runtime URL."""
+    configured = str(setting("APP_BASE_URL", "")).strip()
+    if configured:
+        return normalize_app_base(configured)
+    try:
+        return normalize_app_base(str(st.context.url))
+    except (AttributeError, ValueError, AppError):
+        return ""
+
+
+def pin_form(store, scan_record, *, direct_url=False):
+    """Common verification form for camera scans and URL scans."""
+    st.subheader("인증번호 입력하세요")
+    finished = st.session_state.get("last_notice") in ("VERIFIED", "LOCKED")
+    if not finished:
+        with st.form("pin_form_url" if direct_url else "pin_form_scanner", clear_on_submit=True):
+            pin = st.text_input("인증번호", placeholder="인증번호", max_chars=32, type="password")
+            submitted = st.form_submit_button("확인", type="primary", use_container_width=True)
+    else:
+        submitted = False
+        pin = ""
+    if submitted:
+        try:
+            result = store.verify_scan(scan_record["scan_id"], pin)
+            if result["status"] == "VERIFIED":
+                st.session_state.last_notice = "VERIFIED"
+            elif result["status"] == "LOCKED":
+                st.session_state.last_notice = "LOCKED"
+            else:
+                st.session_state.last_notice = f"PIN_FAILED ({result['attempts']}/5)"
+        except AppError as e:
+            st.error(str(e))
+    if st.session_state.get("last_notice") == "VERIFIED":
+        st.success("인증 성공")
+    elif st.session_state.get("last_notice") == "LOCKED":
+        st.error("인증 실패: 5회 오류로 잠겼습니다.")
+    elif str(st.session_state.get("last_notice", "")).startswith("PIN_FAILED"):
+        st.error("인증 실패 — 번호를 다시 확인해주세요.")
+
+
+def url_qr_view(store, qr_id: str):
+    """Landing page opened by scanning a static QR in the MetaMask home scanner.
+
+    Event means *URL was opened*, not that MetaMask emitted a scanner callback.
+    The session key prevents duplicate SCANNED writes on form reruns.
+    """
+    try:
+        qr_id_from_raw("SCAN:" + qr_id)
+    except AppError:
+        st.error("올바르지 않은 QR 주소입니다.")
+        return
+
+    if st.session_state.get("url_scan_qr_id") != qr_id:
+        st.session_state.url_scan_qr_id = qr_id
+        st.session_state.url_scan_record = None
+        st.session_state.last_notice = ""
+
+    if st.session_state.url_scan_record is None:
+        try:
+            st.session_state.url_scan_record = store.register_scan("SCAN:" + qr_id, "qr-url")
+        except AppError as e:
+            st.error(str(e))
+            return
+
+    pin_form(store, st.session_state.url_scan_record, direct_url=True)
+    if st.session_state.get("last_notice") in ("VERIFIED", "LOCKED"):
+        if st.button("다시 인증하기", use_container_width=True):
+            st.session_state.url_scan_record = None
+            st.session_state.last_notice = ""
+            st.rerun()
+
+
 def scan_view(store, persistent):
     st.title("QRCheck")
     if "scan" not in st.session_state:
@@ -110,28 +184,7 @@ def scan_view(store, persistent):
                     except AppError as e:
                         st.error(str(e))
     else:
-        st.subheader("인증번호 입력하세요")
-        with st.form("pin_form", clear_on_submit=True):
-            pin = st.text_input("인증번호", placeholder="인증번호", max_chars=32, type="password")
-            submitted = st.form_submit_button("확인", type="primary", use_container_width=True)
-        if submitted:
-            try:
-                data = store.verify_scan(st.session_state.scan["scan_id"], pin)
-                if data["status"] == "VERIFIED":
-                    st.session_state.last_notice = "VERIFIED"
-                elif data["status"] == "LOCKED":
-                    st.session_state.last_notice = "LOCKED"
-                else:
-                    st.session_state.last_notice = f"PIN_FAILED ({data['attempts']}/5)"
-            except AppError as e:
-                st.error(str(e))
-        if st.session_state.last_notice == "VERIFIED":
-            st.success("인증 성공")
-        elif st.session_state.last_notice == "LOCKED":
-            st.error("인증 실패: 5회 오류로 잠겼습니다.")
-        elif st.session_state.last_notice.startswith("PIN_FAILED"):
-            st.error("인증 실패 — 번호를 다시 확인해주세요.")
-
+        pin_form(store, st.session_state.scan)
         if st.button("다음 QR 스캔", use_container_width=True):
             st.session_state.scan = None
             st.session_state.last_notice = ""
@@ -188,11 +241,28 @@ def admin_view(store, persistent):
             ix = ids.index(selected) if selected in ids else 0
             qr_id = st.selectbox("발급된 QR 선택", ids, index=ix, format_func=lambda k: labels[k])
             st.session_state.selected_qr = qr_id
-            raw = f"SCAN:{qr_id}"
-            img = qr_png(raw)
-            st.image(img, width=240)
-            st.code(raw)
-            st.download_button("QR 이미지 PNG 다운로드", img, file_name=f"QRCheck-{qr_id}.png", mime="image/png")
+            base = app_base_url()
+            try:
+                url = fixed_qr_url(qr_id, base)
+            except AppError as e:
+                st.warning(str(e))
+            else:
+                st.markdown("**메타마스크 기본 스캐너용 고정 QR (웹페이지 링크)**")
+                img = qr_png(url)
+                st.image(img, width=240)
+                st.code(url, language=None)
+                st.download_button("메타마스크용 QR PNG 다운로드", img,
+                                   file_name=f"QRCheck-MetaMask-{qr_id}.png", mime="image/png")
+                st.link_button("인증 페이지 미리 열기", url)
+                st.caption("메타마스크에서 링크 열기를 승인해야 할 수 있습니다. 페이지가 열린 시점부터 기록됩니다.")
+            with st.expander("기존 내부 스캐너용 QR (SCAN: 형식)"):
+                raw = f"SCAN:{qr_id}"
+                img_legacy = qr_png(raw)
+                st.image(img_legacy, width=180)
+                st.code(raw, language=None)
+                st.download_button("기존 형식 QR PNG", img_legacy,
+                                   file_name=f"QRCheck-Legacy-{qr_id}.png", mime="image/png")
+                st.caption("기존 QR은 메타마스크 홈 화면 스캐너에서 웹페이지로 이동하지 않습니다.")
             with st.form("update_pin"):
                 change_pin = st.text_input("인증번호 변경 (QR 이미지는 유지)", type="password", placeholder="새 숫자 인증번호")
                 save = st.form_submit_button("인증번호 변경 저장")
@@ -247,16 +317,25 @@ def main():
     except AppError as e:
         st.error(str(e))
         return
-    mode = st.query_params.get("mode", "scan")
+    mode = st.query_params.get("mode", "home")
+    qr_id = st.query_params.get("qr")
     if mode == "admin":
         admin_view(store, persistent)
-    else:
+        st.divider()
+        st.markdown("[처음 화면으로 이동](./)")
+    elif qr_id:
+        # A permanent URL QR opens this page from the existing MetaMask QR reader.
+        # This is a web-page-open event, not a native MetaMask scan callback.
+        url_qr_view(store, str(qr_id))
+    elif mode == "scanner":
         scan_view(store, persistent)
-    st.divider()
-    if mode == "admin":
-        st.page_link("streamlit_app.py", label="스캐너로 이동", icon="📷")
-    else:
+        st.divider()
         st.markdown("[관리자 페이지](?mode=admin)")
+    else:
+        st.title("QRCheck")
+        st.info("메타마스크 앱의 기본 QR 스캐너로 관리자가 발급한 QR을 스캔해주세요.")
+        st.markdown("[관리자 페이지](?mode=admin)")
+        st.caption("내부 카메라 스캔 기능이 필요하면 ?mode=scanner 로 접속할 수 있습니다.")
 
 
 if __name__ == "__main__":
