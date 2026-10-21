@@ -1,0 +1,9 @@
+.streamlit/secrets.toml
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+*.sqlite3
+*.sqlite3-journal
+.DS_Store
