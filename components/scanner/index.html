@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QRCheck Scanner</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:transparent;font:16px/1.5 system-ui,-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;color:#222}
+.panel{border:1px solid #dde0e7;border-radius:16px;padding:16px;background:#fff}
+.btn{width:100%;border:0;border-radius:12px;padding:14px;font-size:16px;font-weight:700;cursor:pointer;margin-bottom:10px;background:#2563eb;color:#fff}
+.secondary{background:#f0f3f8;color:#243047}.help{color:#646a75;font-size:13px;margin-top:6px}.msg{font-size:13px;color:#3b4a61;padding:8px 0}
+#preview{display:none;position:relative;margin:10px 0;background:#15171d;overflow:hidden;border-radius:13px}
+video{width:100%;height:290px;object-fit:cover;display:block}#reticle{pointer-events:none;position:absolute;width:60%;height:54%;border:3px solid rgba(255,255,255,.75);border-radius:14px;left:20%;top:23%;box-shadow:0 0 0 999px rgba(0,0,0,.12)}
+#stop{display:none}
+</style>
+<script async src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+</head>
+<body>
+<section class="panel">
+ <button id="mm" class="btn">메타마스크 QR 스캐너 실행</button>
+ <button id="cam" class="btn secondary">휴대폰 카메라로 스캔</button>
+ <div id="preview"><video id="video" playsinline muted autoplay></video><div id="reticle"></div></div>
+ <button id="stop" class="btn secondary">카메라 중지</button>
+ <div id="msg" class="msg">메타마스크 앱 내부 브라우저에서 첫 번째 버튼을 눌러주세요.</div>
+ <div class="help">메타마스크 API가 지원되지 않으면 휴대폰 카메라 방식으로 사용할 수 있습니다. 스캔한 내용은 서버에서 QR ID 유효성을 검사합니다.</div>
+</section>
+<script>
+(function(){
+  const $ = x => document.getElementById(x);
+  let stream=null, active=false, busy=false, lastFrame=0, detector=null, canvas=null, ctx=null;
+  function send(type, data){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type},data||{}),'*')}
+  function resize(){send('streamlit:setFrameHeight',{height:document.documentElement.scrollHeight+4})}
+  function message(text){$('msg').textContent=text;resize()}
+  function stop(){active=false;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;} $('preview').style.display='none';$('stop').style.display='none';resize()}
+  function emit(raw,source){if(busy)return;busy=true;stop();message('QR을 인식했습니다. 서버에서 기록하고 있습니다.');send('streamlit:setComponentValue',{dataType:'json',value:{raw:String(raw),source}})}
+  window.addEventListener('message',e=>{if(e.data && e.data.type==='streamlit:render'){resize()}});
+  send('streamlit:componentReady',{apiVersion:1});
+  $('mm').addEventListener('click', async()=>{
+    message('메타마스크 스캐너 호출 중...');
+    try{
+      let ethereum=window.ethereum;
+      if(!ethereum){try{ethereum=window.parent.ethereum}catch(e){/* inaccessible parent */}}
+      if(!ethereum || typeof ethereum.request!=='function')throw new Error('메타마스크 Provider를 사용할 수 없습니다.');
+      const result=await ethereum.request({method:'wallet_scanQRCode',params:['^SCAN:[A-Za-z0-9_-]+$']});
+      const raw=typeof result==='string'?result:(result && (result.data||result.result||result.value));
+      if(typeof raw!=='string'||!raw.trim())throw new Error('스캔 결과 문자열을 받지 못했습니다.');
+      emit(raw,'metamask-rpc');
+    }catch(error){message('메타마스크 스캐너 실행 불가: '+(error && error.message || '알 수 없는 오류')+' 아래 카메라 방식으로 시도해 주세요.')}
+  });
+  async function frame(time){
+    if(!active)return;
+    window.requestAnimationFrame(frame);
+    if(time-lastFrame<110)return;
+    lastFrame=time;
+    const video=$('video');
+    if(video.readyState<2 || !video.videoWidth)return;
+    try{
+      if(detector){
+        const codes=await detector.detect(video);
+        if(codes && codes.length && codes[0].rawValue){emit(codes[0].rawValue,'browser-camera');return}
+      }else if(window.jsQR){
+        const max=540, scale=Math.min(1,max/Math.max(video.videoWidth,video.videoHeight));
+        canvas.width=Math.ceil(video.videoWidth*scale);canvas.height=Math.ceil(video.videoHeight*scale);
+        ctx.drawImage(video,0,0,canvas.width,canvas.height);
+        const image=ctx.getImageData(0,0,canvas.width,canvas.height);
+        const code=window.jsQR(image.data,image.width,image.height,{inversionAttempts:'dontInvert'});
+        if(code && code.data){emit(code.data,'browser-camera');return}
+      }
+    }catch(e){/* Some camera frames cannot be decoded; keep scanning. */}
+  }
+  $('cam').addEventListener('click',async()=>{
+    if(active||busy)return;
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){message('이 브라우저는 카메라 API를 지원하지 않습니다. HTTPS 연결 여부를 확인하세요.');return}
+    try{
+      message('카메라 권한을 요청하고 있습니다...');
+      if('BarcodeDetector' in window){
+        try{detector=new window.BarcodeDetector({formats:['qr_code']})}catch(e){detector=null}
+      }
+      canvas=document.createElement('canvas');ctx=canvas.getContext('2d',{willReadFrequently:true});
+      stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'}}});
+      $('video').srcObject=stream;
+      await $('video').play();
+      active=true;$('preview').style.display='block';$('stop').style.display='block';
+      message('QR코드를 화면 중앙에 맞춰주세요. 자동으로 인식합니다.');
+      window.requestAnimationFrame(frame);
+    }catch(e){stop();message('카메라 실행 실패: '+(e && e.message || '알 수 없는 오류')+'. 브라우저 카메라 권한을 확인하세요.')}
+  });
+  $('stop').addEventListener('click',()=>{stop();message('카메라가 중지되었습니다.')});
+  window.addEventListener('pagehide',stop);
+  setTimeout(resize,300);resize();
+})();
+</script>
+</body>
+</html>
